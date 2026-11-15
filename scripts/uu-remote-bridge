@@ -2,6 +2,7 @@
 
 set -Eeuo pipefail
 
+use_host_display=false
 bridge_user="${USER:-$(id -un)}"
 bridge_display="${UURB_DISPLAY:-auto}"
 desktop_target="${UURB_DESKTOP_TARGET:-auto}"
@@ -92,7 +93,19 @@ if [[ "$cursor_size_setting" != auto ]]; then
     fi
 fi
 
-if [[ "$bridge_display" == auto ]]; then
+if [[ "${UURB_ON_HOST_DISPLAY:-off}" == on ]]; then
+    use_host_display=true
+    if [[ -S /tmp/.X11-unix/X1 ]]; then
+        bridge_display=:1
+    elif [[ -n "${DISPLAY:-}" ]]; then
+        bridge_display=":${DISPLAY#:}"
+        bridge_display="${bridge_display%%.*}"
+    else
+        printf 'Host display mode needs an X server, and :1 is not available.\n' >&2
+        exit 1
+    fi
+    display_number="${bridge_display#:}"
+elif [[ "$bridge_display" == auto ]]; then
     for display_number in $(/usr/bin/seq 20 99); do
         if [[ ! -e "/tmp/.X11-unix/X$display_number" &&
               ! -e "/tmp/.X${display_number}-lock" ]]; then
@@ -124,10 +137,12 @@ if [[ "$uu_audio_setting" == off ]]; then
     # UU starts a WebRTC capture stream on every controller connection even
     # when the nested FreeRDP relay uses /audio-mode:2. Disable Wine's audio
     # driver only for this dedicated prefix; video and input remain intact.
-    export WINEDLLOVERRIDES='winebth.sys=d;winepulse.drv=d;winedbg.exe=d;mscoree,mshtml='
+    export WINEDLLOVERRIDES='upgrade.exe=d;winebth.sys=d;winepulse.drv=d;winedbg.exe=d;mscoree,mshtml='
 else
-    export WINEDLLOVERRIDES='winebth.sys=d;winedbg.exe=d;mscoree,mshtml='
+    export WINEDLLOVERRIDES='upgrade.exe=d;winebth.sys=d;winedbg.exe=d;mscoree,mshtml='
 fi
+# Product updates must pass the staged manifest/acceptance transaction; the
+# vendor's in-place Upgrade.exe would replace the bridge's patched helpers.
 export OPENSSL_MODULES='C:\Program Files\FreeRDP\ossl-modules'
 export SDL_RENDER_DRIVER=software
 export UU_INPUT_BRIDGE_LOG="C:\\users\\$bridge_user\\Temp\\uu-input-bridge.log"
@@ -142,12 +157,6 @@ state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote-bridge"
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/uu-remote-bridge"
 compat_dir="$WINEPREFIX/compat"
 libei_dir="$compat_dir/libei"
-grd_uses_libei=false
-if LC_ALL=C /usr/bin/readelf -d \
-    /usr/libexec/gnome-remote-desktop-daemon 2>/dev/null | \
-    /usr/bin/grep -F '[libei.so.1]' >/dev/null; then
-    grd_uses_libei=true
-fi
 freerdp_exe="$WINEPREFIX/drive_c/Program Files/FreeRDP/sdl-freerdp.exe"
 cursor_guard_dll="$compat_dir/uu-cursor-guard.dll"
 cursor_guard_log="$WINEPREFIX/drive_c/users/$bridge_user/Temp/uu-cursor-guard.log"
@@ -157,6 +166,7 @@ input_broker_exe="$compat_dir/uu-input-broker.exe"
 x11_input_helper="$compat_dir/uu-x11-input"
 x11_clipboard_helper="$compat_dir/uu-x11-clipboard"
 wine_clipboard_bridge_exe="$compat_dir/uu-wine-clipboard-bridge.exe"
+clipboard_guard_dll="$compat_dir/uu-clipboard-unicode.dll"
 network_filter="$compat_dir/uu-network-filter.so"
 input_injector_exe="$compat_dir/uu-injector.exe"
 service_control_exe="$compat_dir/uu-service-control.exe"
@@ -173,16 +183,16 @@ private_display_file="$runtime_dir/private-display"
 console_focus_file="$runtime_dir/console-focus"
 wine_stop_bin="$HOME/.local/libexec/uu-remote-stop-wine-prefix"
 
-if [[ "$grd_uses_libei" == true ]]; then
-    if [[ ! -x "$libei_dir/libei.so.1.2.1" ||
-          ! -L "$libei_dir/libei.so.1" ]]; then
-        printf 'The patched libei keymap-FD backport is missing; reinstall the bridge.\n' >&2
-        exit 1
-    fi
+if [[ "$desktop_relay" == rdp ]] &&
+   { [[ ! -x "$libei_dir/libei.so.1.2.1" ]] ||
+     [[ ! -L "$libei_dir/libei.so.1" ]]; }; then
+    printf 'The patched libei keymap-FD backport is missing; reinstall the bridge.\n' >&2
+    exit 1
 fi
 
 xvfb_pid=""
 openbox_pid=""
+xcompmgr_pid=""
 grd_pid=""
 freerdp_pid=""
 desktop_x11vnc_pid=""
@@ -192,6 +202,7 @@ input_broker_pid=""
 x11_input_pid=""
 x11_clipboard_pid=""
 wine_clipboard_bridge_pid=""
+host_clipboard_pid=""
 terminal_bridge_pid=""
 server_supervisor_pid=""
 grd_user_service_was_active=false
@@ -354,6 +365,26 @@ default_network_interface() {
         ' | /usr/bin/sort -n -k1,1 | /usr/bin/awk 'NR == 1 {print $2}'
 }
 
+# Called by the existing supervisor once per route check. Its pending variables
+# are local to supervise_server (Bash dynamic scope), not persistent state.
+# Do not tear down a working desktop for one transient NetworkManager decision.
+route_change_requires_restart() {
+    local candidate="$1"
+
+    if [[ -z "$candidate" || "$candidate" == "$active_network_interface" ]]; then
+        pending_network_interface=""
+        pending_network_checks=0
+        return 1
+    fi
+    if [[ "$candidate" == "$pending_network_interface" ]]; then
+        pending_network_checks=$((pending_network_checks + 1))
+    else
+        pending_network_interface="$candidate"
+        pending_network_checks=1
+    fi
+    ((pending_network_checks >= 3))
+}
+
 resolve_cursor_size() {
     local -a display_environment
     local detected=""
@@ -415,6 +446,7 @@ cleanup() {
         "$input_broker_pid" \
         "$x11_input_pid" \
         "$wine_clipboard_bridge_pid" \
+        "$host_clipboard_pid" \
         "$x11_clipboard_pid" \
         "$terminal_bridge_pid" \
         "$winlogon_pid" \
@@ -423,6 +455,7 @@ cleanup() {
         "$desktop_x11vnc_pid" \
         "$grd_pid" \
         "$openbox_pid" \
+        "$xcompmgr_pid" \
         "$xvfb_pid"; do
         if [[ -n "$pid" ]]; then
             kill "$pid" >/dev/null 2>&1 || true
@@ -436,6 +469,7 @@ cleanup() {
             "$input_broker_pid" \
             "$x11_input_pid" \
             "$wine_clipboard_bridge_pid" \
+            "$host_clipboard_pid" \
             "$x11_clipboard_pid" \
             "$terminal_bridge_pid" \
             "$winlogon_pid" \
@@ -444,6 +478,7 @@ cleanup() {
             "$desktop_x11vnc_pid" \
             "$grd_pid" \
             "$openbox_pid" \
+            "$xcompmgr_pid" \
             "$xvfb_pid"; do
             if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
                 processes_alive=true
@@ -454,11 +489,17 @@ cleanup() {
         sleep 0.1
     done
 
+    if [[ -n "$grd_pid" && -x "$HOME/.local/libexec/uu-release-grd-clipboard" ]]; then
+        /usr/bin/timeout --kill-after=1s 3s \
+            "$HOME/.local/libexec/uu-release-grd-clipboard" "$grd_pid" || true
+    fi
+
     for pid in \
         "$server_supervisor_pid" \
         "$input_broker_pid" \
         "$x11_input_pid" \
         "$wine_clipboard_bridge_pid" \
+        "$host_clipboard_pid" \
         "$x11_clipboard_pid" \
         "$terminal_bridge_pid" \
         "$winlogon_pid" \
@@ -467,6 +508,7 @@ cleanup() {
         "$desktop_x11vnc_pid" \
         "$grd_pid" \
         "$openbox_pid" \
+        "$xcompmgr_pid" \
         "$xvfb_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
             kill -KILL "$pid" >/dev/null 2>&1 || true
@@ -837,12 +879,10 @@ start_desktop_relay() {
     desktop_environment=(
         "DBUS_SESSION_BUS_ADDRESS=$desktop_bus"
         "DISPLAY=$desktop_display"
+        "LD_LIBRARY_PATH=$libei_dir"
         "OPENSSL_CONF=/etc/ssl/openssl.cnf"
         "OPENSSL_MODULES=$native_openssl_modules"
     )
-    if [[ "$grd_uses_libei" == true ]]; then
-        desktop_environment+=("LD_LIBRARY_PATH=$libei_dir")
-    fi
     if [[ -n "$desktop_wayland" ]]; then
         desktop_environment+=("WAYLAND_DISPLAY=$desktop_wayland")
     fi
@@ -980,15 +1020,13 @@ start_x11_input_helper() {
 start_x11_clipboard_helper() {
     local selected_xauthority
 
-    if [[ "$desktop_relay" != vnc ]]; then
-        return 0
-    fi
     if [[ ! -x "$x11_clipboard_helper" ]]; then
         log 'The optional one-way X11 clipboard helper is missing; retaining the existing clipboard behavior.'
         return 0
     fi
-    if [[ "$desktop_session_type" != x11 || -z "$desktop_display" ]]; then
-        log "One-way Mac clipboard forwarding requires the selected physical X11 desktop; selected ${desktop_session_type:-unknown}."
+    if [[ ( "$desktop_session_type" != x11 && "$desktop_session_type" != wayland ) ||
+          -z "$desktop_display" ]]; then
+        log "One-way Mac clipboard forwarding requires the selected X11/Xwayland display; selected ${desktop_session_type:-unknown}."
         return 0
     fi
     selected_xauthority="$desktop_xauthority"
@@ -1053,7 +1091,7 @@ start_wine_clipboard_bridge() {
         wine_clipboard_bridge_pid=""
         return 0
     fi
-    log 'Mac/UU clipboard forwarding is active: GameViewer CF_UNICODETEXT -> physical X11 only.'
+    log 'Mac/UU clipboard forwarding is active: GameViewer CF_UNICODETEXT -> selected X11/Xwayland desktop only.'
 }
 
 start_terminal_bridge() {
@@ -1135,7 +1173,7 @@ fi
 if ! align_resolution_at_startup; then
     exit 1
 fi
-log "Using private display $DISPLAY at $resolution and RDP port $rdp_port."
+log "Using display $DISPLAY at $resolution and RDP port $rdp_port."
 if [[ "$cursor_guard_setting" == on ]]; then
     resolve_cursor_size
 fi
@@ -1145,38 +1183,67 @@ fi
 
 touch "$xauth_file"
 chmod 600 "$xauth_file"
-/usr/bin/xauth -f "$xauth_file" add "$DISPLAY" . "$(/usr/bin/mcookie)"
-export XAUTHORITY="$xauth_file"
-
-/usr/bin/Xvfb "$DISPLAY" \
-    -screen 0 "${resolution}x24" \
-    -dpi 96 \
-    -nolisten tcp \
-    -noreset \
-    -auth "$xauth_file" \
-    >>"$state_dir/xvfb.log" 2>&1 &
-xvfb_pid=$!
-
-x_ready=false
-for _ in {1..100}; do
-    if /usr/bin/xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-        x_ready=true
-        break
+if [[ "$use_host_display" == true ]]; then
+    host_xauthority="${manager_xauthority:-/run/user/$UID/gdm/Xauthority}"
+    if [[ ! -r "$host_xauthority" ]]; then
+        log "Host X authority is not readable: $host_xauthority"
+        exit 1
     fi
-    sleep 0.1
-done
+    cp "$host_xauthority" "$xauth_file"
+    export XAUTHORITY="$xauth_file"
+    if ! /usr/bin/xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+        log "Host display $DISPLAY did not accept the copied X authority."
+        exit 1
+    fi
+    log 'UU is drawing on the real desktop. No private X server, no nested VNC viewer.'
+else
+    /usr/bin/xauth -f "$xauth_file" add "$DISPLAY" . "$(/usr/bin/mcookie)"
+    export XAUTHORITY="$xauth_file"
 
-if [[ "$x_ready" != true ]]; then
-    log 'The private X11 display did not become ready.'
-    exit 1
+    /usr/bin/Xvfb "$DISPLAY" \
+        -screen 0 "${resolution}x24" \
+        -dpi 96 \
+        -nolisten tcp \
+        -noreset \
+        -auth "$xauth_file" \
+        >>"$state_dir/xvfb.log" 2>&1 &
+    xvfb_pid=$!
+
+    x_ready=false
+    for _ in {1..100}; do
+        if /usr/bin/xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+            x_ready=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [[ "$x_ready" != true ]]; then
+        log 'The private X11 display did not become ready.'
+        exit 1
+    fi
 fi
 private_display_tmp="$private_display_file.$$"
 printf '%s\n' "$DISPLAY" >"$private_display_tmp"
 chmod 0600 "$private_display_tmp"
 mv "$private_display_tmp" "$private_display_file"
 
-/usr/bin/openbox >>"$state_dir/openbox.log" 2>&1 &
-openbox_pid=$!
+if [[ "$use_host_display" != true ]]; then
+    /usr/bin/openbox >>"$state_dir/openbox.log" 2>&1 &
+    openbox_pid=$!
+    # ARGB login dialogs render as a solid black blob without a compositor on
+    # Xvfb. xcompmgr -n enables alpha without stacking extra shadows.
+    if [[ -x /usr/bin/xcompmgr ]]; then
+        /usr/bin/xcompmgr -n >>"$state_dir/xcompmgr.log" 2>&1 &
+        xcompmgr_pid=$!
+    fi
+fi
+if [[ "$use_host_display" == true ]]; then
+    # No nested VNC viewer, so remote pointer and keys cannot be forwarded
+    # through it. Inject them straight into this X display.
+    keyboard_route=x11
+    export UURB_KEYBOARD_ROUTE=x11
+fi
 start_x11_input_helper
 start_x11_clipboard_helper
 
@@ -1300,6 +1367,24 @@ if ! /opt/wine-stable/bin/wine "$input_injector_exe" \
     exit 1
 fi
 start_wine_clipboard_bridge
+
+# Opt-in return path for actual desktop copies. Keep semantic phone/IME text
+# and incoming clipboard owners out of it; never synthesize a paste here.
+vnc_client_cut_text=1
+if [[ "${UURB_HOST_CLIPBOARD:-off}" == on && "$desktop_relay" == vnc &&
+      -n "$x11_clipboard_port" && -n "$wine_clipboard_bridge_pid" ]]; then
+    /usr/bin/env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" \
+        /usr/bin/python3 "$HOME/.local/libexec/uu-host-clipboard" \
+        --wine-clipboard-writer "$wine_clipboard_bridge_exe" \
+        --host-display "$desktop_display" \
+        --host-authority "$desktop_xauthority" --bridge-pid "$$" \
+        >>"$state_dir/host-clipboard.log" 2>&1 &
+    host_clipboard_pid=$!
+    # The authenticated GameViewer companion handles inbound text. Do not
+    # bounce the return clipboard back through the private VNC viewer.
+    vnc_client_cut_text=0
+    log 'Host-to-UU text clipboard enabled; semantic and incoming owners excluded.'
+fi
 if [[ "$cursor_guard_setting" == on ]]; then
     cursor_guard_windows_path="$(
         /opt/wine-stable/bin/winepath -w "$cursor_guard_dll"
@@ -1411,6 +1496,10 @@ if [[ "$desktop_relay" == rdp ]]; then
             --name '^Ubuntu-Desktop-Relay$' 2>/dev/null \
             | /usr/bin/tail -n 1
     )"
+elif [[ "$use_host_display" == true ]]; then
+    relay_ready=true
+    relay_window_id=""
+    log 'Host display: UU windows are on the real desktop; not opening a nested VNC viewer.'
 else
     desktop_vnc_display=$((desktop_vnc_port - 5900))
     /usr/bin/env \
@@ -1431,7 +1520,7 @@ else
         -GrabKeyboard="$vnc_grab_keyboard_value" \
         -SendKeyEvents=1 \
         -SendPointerEvents=1 \
-        -ClientCutText=1 \
+        -ClientCutText="$vnc_client_cut_text" \
         -ServerCutText=0 \
         -SendPrimary=0 \
         -SendInitialClipboard=0 \
@@ -1471,27 +1560,63 @@ else
     fi
 fi
 
-if [[ -z "$relay_window_id" ]]; then
+if [[ -z "$relay_window_id" && "$use_host_display" != true ]]; then
     log 'Could not identify the Ubuntu desktop relay window.'
     exit 1
 fi
-/usr/bin/xdotool windowactivate --sync "$relay_window_id" \
-    >/dev/null 2>&1 || true
+if [[ "$use_host_display" != true && -n "$relay_window_id" ]]; then
+    /usr/bin/xdotool windowactivate --sync "$relay_window_id" \
+        >/dev/null 2>&1 || true
+fi
 
 bootstrap_account() {
+    local attempt clipboard_guard_windows_path clipboard_client_windows_path
+    local gameviewer_launcher="${UURB_GAMEVIEWER_LAUNCHER:-$HOME/.local/bin/uu-remote-gameviewer}"
     /opt/wine-stable/bin/wine "$service_control_exe" \
         GameViewerService 133 \
         >>"$state_dir/service-control.log" 2>&1 || true
-    /opt/wine-stable/bin/wine start /unix "$uu_app_dir/GameViewer.exe" \
-        >>"$state_dir/client-bootstrap.log" 2>&1 || true
+    # Prefer the GL-safe launcher (llvmpipe + no DRM nodes). Do NOT auto-respawn
+    # here: a supervise loop makes UU appear to reboot every few seconds.
+    if [[ -x "$gameviewer_launcher" ]]; then
+        "$gameviewer_launcher" >>"$state_dir/client-bootstrap.log" 2>&1 &
+        disown $! 2>/dev/null || true
+    else
+        /opt/wine-stable/bin/wine start /unix "$uu_app_dir/GameViewer.exe" \
+            >>"$state_dir/client-bootstrap.log" 2>&1 || true
+    fi
 
     # Keep the layered Wine/Qt management window mapped. Minimizing it while
     # its top-level windows are still being replaced can raise BadWindow,
     # terminate the GUI IPC client, and make the server destroy its room.
     # The relay focus supervisor safely keeps this window behind the desktop.
     sleep 1
-    /usr/bin/xdotool windowactivate --sync "$relay_window_id" \
-        >/dev/null 2>&1 || true
+    if [[ "${UURB_HOST_CLIPBOARD:-off}" == on && -f "$clipboard_guard_dll" ]] &&
+            clipboard_guard_windows_path="$(
+                /usr/bin/timeout 5 /opt/wine-stable/bin/winepath -w "$clipboard_guard_dll" \
+                    2>>"$state_dir/clipboard-guard-injector.log"
+            )" && [[ -n "$clipboard_guard_windows_path" ]] &&
+            clipboard_client_windows_path="$(
+                /usr/bin/timeout 5 /opt/wine-stable/bin/winepath -w "$uu_app_dir/bin/GameViewer.exe" \
+                    2>>"$state_dir/clipboard-guard-injector.log"
+            )" && [[ -n "$clipboard_client_windows_path" ]]; then
+        # One bounded startup attachment, not a periodic injection loop.
+        # The DLL independently rejects unreviewed vendor builds. Failure
+        # leaves remote access available; verify.sh reports missing support.
+        # The outer launcher has the SAME name. Match the full bin/GUI path
+        # so an early successful load into the launcher cannot end this retry.
+        for attempt in {1..8}; do
+            if /usr/bin/timeout 15 /opt/wine-stable/bin/wine "$input_injector_exe" \
+                "$clipboard_guard_windows_path" "$clipboard_client_windows_path" \
+                >>"$state_dir/clipboard-guard-injector.log" 2>&1; then
+                break
+            fi
+            sleep 0.25
+        done
+    fi
+    if [[ "$use_host_display" != true && -n "$relay_window_id" ]]; then
+        /usr/bin/xdotool windowactivate --sync "$relay_window_id" \
+            >/dev/null 2>&1 || true
+    fi
 }
 
 # UU's GUI sends the account-login IPC message that makes the background
@@ -1510,6 +1635,8 @@ supervise_server() {
     local health_checks=0
     local missing_checks=0
     local network_route_checks=0
+    local pending_network_interface=""
+    local pending_network_checks=0
     local current_desktop_resolution
     local pending_resolution=""
     local pending_resolution_checks=0
@@ -1541,7 +1668,21 @@ supervise_server() {
             fi
         fi
         focus_checks=$((focus_checks + 1))
-        if ((focus_checks >= 4)); then
+        if [[ "$use_host_display" == true ]] && ((focus_checks % 8 == 0)); then
+            # A new remote window was opening at ~3016x1736 on this 4K desktop,
+            # covering the cursor and stalling input. Shrink it once; do not
+            # raise or restack on later passes.
+            while read -r host_window; do
+                [[ -n "$host_window" ]] || continue
+                eval "$(/usr/bin/xdotool getwindowgeometry --shell "$host_window" 2>/dev/null)" || continue
+                if (( ${WIDTH:-0} > 1600 || ${HEIGHT:-0} > 1000 )); then
+                    /usr/bin/xdotool windowsize "$host_window" 1280 720 \
+                        windowmove "$host_window" 80 60 >/dev/null 2>&1 || true
+                fi
+            done < <(
+                /usr/bin/xdotool search --class 'gameviewer.exe' 2>/dev/null || true
+            )
+        elif [[ "$use_host_display" != true ]] && ((focus_checks >= 4)); then
             focus_checks=0
             # RealVNC may replace its initial top-level window when it enters
             # full-screen mode. Refresh the ID before focusing so an obsolete
@@ -1588,11 +1729,9 @@ supervise_server() {
             network_route_checks=$((network_route_checks + 1))
             if ((network_route_checks >= 40)); then
                 network_route_checks=0
-                current_default_interface="$(default_network_interface)"
-                if [[ -n "$current_default_interface" && \
-                      "$current_default_interface" != \
-                      "$active_network_interface" ]]; then
-                    log "Default network interface changed from $active_network_interface to $current_default_interface; restarting UU on the preferred route."
+                current_default_interface="$(default_network_interface || true)"
+                if route_change_requires_restart "$current_default_interface"; then
+                    log "Default network interface changed from $active_network_interface to $current_default_interface for 3 consecutive checks; restarting UU on the preferred route."
                     return 1
                 fi
             fi
@@ -1646,14 +1785,13 @@ server_supervisor_pid=$!
 log "UU Remote and the $desktop_relay desktop relay share DISPLAY=$DISPLAY; physical keyboard route=$active_keyboard_route; semantic phone text helper=$([[ -n "$x11_input_port" ]] && printf active || printf unavailable); one-way Mac clipboard=$([[ -n "$wine_clipboard_bridge_pid" ]] && printf active || printf unavailable)."
 
 set +e
-critical_pids=(
-    "$xvfb_pid"
-    "$openbox_pid"
-    "$winlogon_pid"
-    "$input_broker_pid"
-    "$server_supervisor_pid"
-)
-for optional_pid in \
+critical_pids=()
+for critical_pid in \
+    "$xvfb_pid" \
+    "$openbox_pid" \
+    "$winlogon_pid" \
+    "$input_broker_pid" \
+    "$server_supervisor_pid" \
     "$grd_pid" \
     "$freerdp_pid" \
     "$desktop_x11vnc_pid" \
@@ -1661,10 +1799,10 @@ for optional_pid in \
     "$x11_input_pid" \
     "$x11_clipboard_pid" \
     "$wine_clipboard_bridge_pid" \
+    "$host_clipboard_pid" \
     "$terminal_bridge_pid"; do
-    if [[ -n "$optional_pid" ]]; then
-        critical_pids+=("$optional_pid")
-    fi
+    [[ -n "$critical_pid" ]] || continue
+    critical_pids+=("$critical_pid")
 done
 exited_pid=""
 wait -n -p exited_pid "${critical_pids[@]}"

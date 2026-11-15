@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Launch UU GameViewer GUI on the bridge private display with a GL stack that
+# actually stays alive on this NVIDIA+AMD host (Xvfb + llvmpipe, no DRM nodes).
+set -Eeuo pipefail
+
+wine_prefix="${WINEPREFIX:-$HOME/.local/share/wineprefixes/uu-remote}"
+wine_bin="${UURB_WINE:-/opt/wine-stable/bin/wine}"
+uu_app="$wine_prefix/drive_c/Program Files/Netease/GameViewer"
+bridge_runtime="${XDG_RUNTIME_DIR:-/run/user/$UID}/uu-remote-bridge"
+display_file="$bridge_runtime/private-display"
+xauth_file="$bridge_runtime/Xauthority"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote-bridge"
+log_file="$state_dir/gameviewer-gui.log"
+
+[[ -f "$uu_app/GameViewer.exe" ]] || {
+    printf 'GameViewer.exe missing in %s\n' "$uu_app" >&2
+    exit 1
+}
+[[ -x "$wine_bin" ]] || {
+    printf 'Wine missing: %s\n' "$wine_bin" >&2
+    exit 1
+}
+mkdir -p "$state_dir"
+
+# Host GUI draws on the caller's real X display. The private Xvfb + VNC clip
+# path is only for the incoming desktop relay, not for looking at UU itself.
+if [[ "${UURB_HOST_GUI:-0}" == 1 ]]; then
+    display="${DISPLAY:-}"
+    xauth_file="${XAUTHORITY:-}"
+    [[ -n "$display" ]] || {
+        printf 'Host GUI needs DISPLAY.\n' >&2
+        exit 1
+    }
+else
+    [[ -r "$display_file" && -r "$xauth_file" ]] || {
+        printf 'Bridge private display is not ready.\n' >&2
+        exit 1
+    }
+    display="$(tr -d '[:space:]' <"$display_file")"
+    # Drop zombie chrome from previous exit-0 runs on the private display.
+    while read -r window; do
+        /usr/bin/env DISPLAY="$display" XAUTHORITY="$xauth_file" \
+            /usr/bin/xdotool windowkill "$window" >/dev/null 2>&1 || true
+    done < <(
+        /usr/bin/env DISPLAY="$display" XAUTHORITY="$xauth_file" \
+            /usr/bin/xdotool search --class 'gameviewer.exe' 2>/dev/null || true
+    )
+fi
+/usr/bin/env WINEPREFIX="$wine_prefix" WINEDEBUG=-all \
+    "$wine_bin" taskkill /F /IM GameViewer.exe >>"$log_file" 2>&1 || true
+sleep 0.2
+
+# On the real desktop, software GL at 4K stalls the UI thread and the
+# cgroup memory cap then freezes the window under the cursor. Use the
+# host GPU there. The llvmpipe sandbox stays for the private Xvfb only.
+if [[ "$display" == ":1" || "${UURB_ON_HOST_DISPLAY:-off}" == on ]]; then
+    exec /usr/bin/env \
+        DISPLAY="$display" \
+        XAUTHORITY="$xauth_file" \
+        WINEPREFIX="$wine_prefix" \
+        WINEDEBUG=-all \
+        WINEDLLOVERRIDES='winedbg.exe=d;mscoree,mshtml=' \
+        "$wine_bin" "$uu_app/GameViewer.exe" >>"$log_file" 2>&1
+fi
+
+# Hide DRM nodes so Qt/ANGLE cannot pick the broken AMD device and then quit.
+# Force mesa llvmpipe on the Xvfb GLX path.
+if [[ -x /usr/bin/bwrap ]]; then
+    exec /usr/bin/bwrap --die-with-parent \
+        --bind / / \
+        --dev /dev \
+        --tmpfs /dev/dri \
+        --setenv DISPLAY "$display" \
+        --setenv XAUTHORITY "$xauth_file" \
+        --setenv WINEPREFIX "$wine_prefix" \
+        --setenv WINEDEBUG -all \
+        --setenv WINEDLLOVERRIDES 'winedbg.exe=d;mscoree,mshtml=' \
+        --setenv LIBGL_ALWAYS_SOFTWARE 1 \
+        --setenv GALLIUM_DRIVER llvmpipe \
+        --setenv __GLX_VENDOR_LIBRARY_NAME mesa \
+        --setenv __EGL_VENDOR_LIBRARY_FILENAMES /usr/share/glvnd/egl_vendor.d/50_mesa.json \
+        --setenv QT_OPENGL software \
+        --setenv QT_XCB_FORCE_SOFTWARE_OPENGL 1 \
+        "$wine_bin" "$uu_app/GameViewer.exe" >>"$log_file" 2>&1
+fi
+
+exec /usr/bin/env \
+    DISPLAY="$display" \
+    XAUTHORITY="$xauth_file" \
+    WINEPREFIX="$wine_prefix" \
+    WINEDEBUG=-all \
+    WINEDLLOVERRIDES='winedbg.exe=d;mscoree,mshtml=' \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=llvmpipe \
+    __GLX_VENDOR_LIBRARY_NAME=mesa \
+    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
+    QT_OPENGL=software \
+    QT_XCB_FORCE_SOFTWARE_OPENGL=1 \
+    "$wine_bin" "$uu_app/GameViewer.exe" >>"$log_file" 2>&1

@@ -13,12 +13,12 @@ RestartSec=30
 TimeoutStopSec=15
 KillMode=control-group
 LimitNOFILE=65536
-# The relay normally stays below 2 GiB. Contain an upstream Wine/thread leak
-# inside this restartable service instead of allowing it to stall the desktop.
-MemoryHigh=3G
-MemoryMax=4G
-MemorySwapMax=2G
-TasksMax=1024
+# WebView2 on a 4K desktop sits around 4 GiB. A 3 GiB MemoryHigh
+# throttles the UI thread until GNOME reports the window as not responding.
+MemoryHigh=12G
+MemoryMax=16G
+MemorySwapMax=8G
+TasksMax=4096
 OOMPolicy=stop
 
 [Install]
