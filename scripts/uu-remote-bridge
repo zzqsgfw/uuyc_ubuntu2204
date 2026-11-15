@@ -127,6 +127,14 @@ else
     fi
 fi
 
+# Host-display capture reads the X framebuffer. The hardware cursor is not
+# in those pixels, and Wine has no Win32 cursor for UU's cursor channel.
+# Turn the reader guard on here so a checkout reproduces a visible pointer
+# without a machine-local environment edit.
+if [[ "$use_host_display" == true ]]; then
+    cursor_guard_setting=on
+fi
+
 export DISPLAY="$bridge_display"
 export WINEPREFIX="$wine_prefix"
 export WINEDEBUG=-all
@@ -1243,6 +1251,7 @@ if [[ "$use_host_display" == true ]]; then
     # through it. Inject them straight into this X display.
     keyboard_route=x11
     export UURB_KEYBOARD_ROUTE=x11
+    log 'Host display mode enables the UU cursor reader guard.'
 fi
 start_x11_input_helper
 start_x11_clipboard_helper

@@ -93,6 +93,11 @@ saved_phone_text_mode="$(saved_setting UURB_PHONE_TEXT_MODE)"
 phone_text_mode="${UURB_PHONE_TEXT_MODE:-${saved_phone_text_mode:-auto}}"
 saved_cursor_guard="$(saved_setting UURB_CURSOR_GUARD)"
 cursor_guard_setting="${UURB_CURSOR_GUARD:-${saved_cursor_guard:-off}}"
+saved_on_host_display="$(saved_setting UURB_ON_HOST_DISPLAY)"
+on_host_display="${UURB_ON_HOST_DISPLAY:-${saved_on_host_display:-off}}"
+if [[ "$on_host_display" == on ]]; then
+    cursor_guard_setting=on
+fi
 
 bridge_service_active() {
     if "${systemctl_user[@]}" is-active --quiet uu-remote-bridge.service; then

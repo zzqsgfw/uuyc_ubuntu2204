@@ -52,6 +52,7 @@ saved_follow_desktop_resolution="$(
     saved_setting UURB_FOLLOW_DESKTOP_RESOLUTION
 )"
 saved_display="$(saved_setting UURB_DISPLAY)"
+saved_on_host_display="$(saved_setting UURB_ON_HOST_DISPLAY)"
 saved_desktop_target="$(saved_setting UURB_DESKTOP_TARGET)"
 saved_desktop_relay="$(saved_setting UURB_DESKTOP_RELAY)"
 saved_shared_vnc_port="$(saved_setting UURB_DESKTOP_VNC_PORT)"
@@ -72,6 +73,7 @@ rdp_port="${UURB_RDP_PORT:-${saved_rdp_port:-3390}}"
 resolution="${UURB_RESOLUTION:-${saved_resolution:-1920x1080}}"
 follow_desktop_resolution="${UURB_FOLLOW_DESKTOP_RESOLUTION:-${saved_follow_desktop_resolution:-off}}"
 bridge_display="${UURB_DISPLAY:-${saved_display:-auto}}"
+on_host_display="${UURB_ON_HOST_DISPLAY:-${saved_on_host_display:-off}}"
 desktop_target="${UURB_DESKTOP_TARGET:-${saved_desktop_target:-auto}}"
 desktop_relay="${UURB_DESKTOP_RELAY:-${saved_desktop_relay:-rdp}}"
 shared_vnc_port="${UURB_DESKTOP_VNC_PORT:-${saved_shared_vnc_port:-}}"
@@ -84,6 +86,7 @@ keyboard_route="${UURB_KEYBOARD_ROUTE:-${saved_keyboard_route:-rdp}}"
 phone_text_mode="${UURB_PHONE_TEXT_MODE:-${saved_phone_text_mode:-auto}}"
 network_interface="${UURB_NETWORK_INTERFACE:-${saved_network_interface:-all}}"
 cursor_guard="${UURB_CURSOR_GUARD:-${saved_cursor_guard:-off}}"
+cursor_guard_explicit=false
 cursor_size="${UURB_CURSOR_SIZE:-${saved_cursor_size:-auto}}"
 console_vnc_port="${UURB_CONSOLE_VNC_PORT:-${saved_console_vnc_port:-5920}}"
 console_web_port="${UURB_CONSOLE_WEB_PORT:-${saved_console_web_port:-6080}}"
@@ -110,6 +113,9 @@ usage: ./install.sh [options]
                          after a stable X11 desktop resize, align and restart
                          only the UU bridge (default: off)
   --display auto|:N      private X display (default: first free from :20)
+  --host-display off|on  draw UU on the logged-in X desktop instead of a
+                         private X server (default: off). On turns the cursor
+                         reader guard on, because that capture has no pointer.
   --desktop-target TARGET
                          shared GNOME desktop: auto, xrdp, physical, or :N
                          (default: auto; explicit targets never fall back)
@@ -183,6 +189,10 @@ while (($#)); do
             bridge_display="${2:?--display requires auto or :N}"
             shift 2
             ;;
+        --host-display)
+            on_host_display="${2:?--host-display requires off or on}"
+            shift 2
+            ;;
         --desktop-target)
             desktop_target="${2:?--desktop-target requires auto, xrdp, physical, or :N}"
             shift 2
@@ -221,6 +231,7 @@ while (($#)); do
             ;;
         --cursor-guard)
             cursor_guard="${2:?--cursor-guard requires off or on}"
+            cursor_guard_explicit=true
             shift 2
             ;;
         --cursor-size)
@@ -392,6 +403,13 @@ if [[ "$network_interface" != all &&
     printf 'The requested UU network interface does not exist: %s\n' \
         "$network_interface" >&2
     exit 2
+fi
+if [[ "$on_host_display" != off && "$on_host_display" != on ]]; then
+    printf 'The host display mode must be off or on.\n' >&2
+    exit 2
+fi
+if [[ "$on_host_display" == on && "$cursor_guard_explicit" != true ]]; then
+    cursor_guard=on
 fi
 if [[ "$cursor_guard" != off && "$cursor_guard" != on ]]; then
     printf 'The cursor guard must be off or on.\n' >&2
@@ -807,6 +825,7 @@ printf 'UURB_RESOLUTION=%s\n' "$resolution" >>"$environment_tmp"
 printf 'UURB_FOLLOW_DESKTOP_RESOLUTION=%s\n' \
     "$follow_desktop_resolution" >>"$environment_tmp"
 printf 'UURB_DISPLAY=%s\n' "$bridge_display" >>"$environment_tmp"
+printf 'UURB_ON_HOST_DISPLAY=%s\n' "$on_host_display" >>"$environment_tmp"
 printf 'UURB_DESKTOP_TARGET=%s\n' "$desktop_target" >>"$environment_tmp"
 printf 'UURB_DESKTOP_RELAY=%s\n' "$desktop_relay" >>"$environment_tmp"
 if [[ -n "$shared_vnc_port" ]]; then

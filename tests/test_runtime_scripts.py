@@ -276,6 +276,8 @@ class RuntimeScriptTests(unittest.TestCase):
         self.assertIn("UURB_RESOLUTION=%s", installer)
         self.assertIn("UURB_FOLLOW_DESKTOP_RESOLUTION=%s", installer)
         self.assertIn("UURB_DISPLAY=%s", installer)
+        self.assertIn("UURB_ON_HOST_DISPLAY=%s", installer)
+        self.assertIn("--host-display off|on", installer)
         self.assertIn("UURB_DESKTOP_TARGET=%s", installer)
         self.assertIn("UURB_DESKTOP_RELAY=%s", installer)
         self.assertIn("UURB_GRD_FD_RESTART_THRESHOLD=%s", installer)
@@ -840,6 +842,10 @@ terminal_bridge_pid=
         self.assertIn("src/uu_cursor_guard.c", digest)
         self.assertIn(
             'cursor_guard_setting="${UURB_CURSOR_GUARD:-off}"',
+            launcher,
+        )
+        self.assertIn(
+            "Host display mode enables the UU cursor reader guard.",
             launcher,
         )
         self.assertIn('[[ "$cursor_guard_setting" == on ]]', launcher)
